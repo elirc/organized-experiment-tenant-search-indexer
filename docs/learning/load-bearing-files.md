@@ -62,3 +62,17 @@
 - What it calls: `src/repositories/tenantSearchStateRepository.ts`, `src/repositories/indexingJobRepository.ts`, and `src/repositories/auditLogRepository.ts`.
 - What would break or become insecure if this file were wrong: Rebuilds could be queued concurrently for the same tenant, making generation management unsafe.
 - What a junior engineer would likely miswrite here: They would fire the rebuild synchronously from the route instead of creating a durable job.
+
+---
+
+## Senior review notes (evidence-backed)
+
+| File | Problem today | Evidence |
+| --- | --- | --- |
+| `src/services/indexingJobRunner.ts` | No claim, no transaction around incremental writes, duplicate keys in one upsert, runs inside an HTTP request | `:35-40`, `:91-95`, `:75-91` |
+| `src/repositories/indexingJobRepository.ts` | Cross-tenant queue read; status updates by id only; select-then-insert coalescing | `:61-68`, `:70-107`, `:33-58` |
+| `src/repositories/searchSyncEventRepository.ts` | Cursor plus `processedAt` filter can skip late commits | `:33-38` |
+| `src/repositories/tenantSearchStateRepository.ts` | No way to clear a stuck `rebuildingGeneration` | `:66-92` |
+| `src/repositories/searchDocumentRepository.ts` | Vector computed per query, no index; upsert ignores `sourceVersion` | `:70-72`, `:35-50` |
+| `src/lib/auth/session.ts` | Identity is an unauthenticated header | `:17-25` |
+| `src/services/ticketService.ts` | Status check-then-update without a guard; `externalId` collision chance | `:114-128`, `:33-35` |

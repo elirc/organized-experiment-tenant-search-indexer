@@ -59,3 +59,48 @@ Risk if wrong: Teams optimize only one side and either end up with slow reads or
 Where to look: `src/services/indexingService.ts` — `requestIndexRebuild()` reserves a new generation and queues durable work.
 Also see: `src/services/indexingJobRunner.ts` — `runRebuildJob()` writes the new generation, flips it, then removes the old generation.
 Risk if wrong: Rebuilds overwrite live data or expose half-built indexes to readers.
+
+
+---
+
+# Concepts in depth: mechanism, limit, check
+
+Each concept above is expanded with how *this* code implements it, where the implementation stops, and a check. Checks marked *(run)* were executed with plain `node --test` on functions copied from the repo; all five scratch tests passed.
+
+## Transactional outbox
+
+**Mechanism.** The business row and the event that describes it commit together. In `createTicket()` the insert into `tickets` and the insert into `search_sync_events` share `tx` (`src/services/ticketService.ts:40-68`). If the transaction rolls back, neither exists, so the indexer can never see an event for a ticket that does not exist, nor miss an event for one that does.
+
+**Limit.** An outbox is only half the pattern. The consumer here (`runIncrementalJob()`) is not transactional, has no claim, and uses a cursor that can skip late-committing events (findings T2, T7 in `docs/architecture/README.md`).
+
+**Check.** Name the four other writes that ride in the same transaction as the ticket insert.
+*Answer:* sync event, `touchTenantSourceChange()`, `ensureQueuedIncrementalJob()`, `createAuditLog()` (`ticketService.ts:58-87`).
+
+## Read model with generations (blue/green index)
+
+**Mechanism.** Search reads only `generation = activeGeneration` (`src/repositories/searchDocumentRepository.ts:77`). A rebuild writes generation N+1 alongside N, then flips the pointer and deletes N in one transaction (`src/services/indexingJobRunner.ts:125-129`). Readers see either all of N or all of N+1.
+
+**Limit.** Changes processed incrementally *during* a rebuild go to N and are deleted at the flip (finding T4). A failed rebuild leaves `rebuildingGeneration` set forever (T3).
+
+**Check.** Why must `deleteGenerationDocuments()` filter by tenant as well as generation?
+*Answer:* every tenant starts at generation 1 (`src/db/schema.ts`, `activeGeneration` default 1), so "generation 1" exists for every tenant at once. The comment at `searchDocumentRepository.ts:127` says the same.
+
+## Freshness reporting
+
+**Mechanism.** `searchDocuments()` returns `indexState` with `pendingEventCount` and `isStale` (`src/services/searchService.ts:36-45`). `isStale` is true if any event is unprocessed or the last source change is newer than the last indexing.
+
+**Check (run).** `isStale(0, { lastSourceChangeAt: null, lastIndexedAt: null })` is `false`; `isStale(3, ...)` is `true`. Note that after finding T2 wedges a tenant, `pendingEventCount` stays above zero, so the UI will correctly show "stale" forever. The signal works; nothing acts on it.
+
+## Query normalisation and pagination
+
+**Check (run).** `normalizeSearchQuery({ query: "  reset   password ", page: 3, pageSize: 10 })` returns `query: "reset password"` and `offset: 20` (`src/lib/search/query.ts:13-22`). The query text then goes to `websearch_to_tsquery('english', ...)` as a bound parameter (`searchDocumentRepository.ts:70`), so quotes, `OR` and `-term` in user input are interpreted as web-search syntax, not SQL.
+
+## Status transitions as data
+
+**Check (run).** From `OPEN`, every status is reachable (`OPEN,IN_PROGRESS,CLOSED,RESOLVED`), `OPEN → RESOLVED` directly is not allowed, `RESOLVED → IN_PROGRESS` (reopen) is allowed, and `CLOSED` has no exits (`src/lib/search/ticket-status.ts:9-14`).
+
+**Limit.** The check-then-update in `updateTicketStatus()` reads the row and then updates it without a status condition or row lock (`ticketService.ts:114-128`). Two concurrent changes from `OPEN` (one to `IN_PROGRESS`, one to `CLOSED`) can both pass validation; the last write wins, and both emit events.
+
+## Honesty note
+
+Concepts the name "indexer" suggests but the code does not contain (a worker process, retries with backoff, dead-letter handling, a stored `tsvector` with a GIN index, delete propagation) are not taught here. See the guarantees table in `docs/architecture/README.md`.

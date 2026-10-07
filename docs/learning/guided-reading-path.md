@@ -83,3 +83,21 @@
 **What to look for:** The assertion that `searchDocuments()` passes `tenantId` into the repository call.
 **What to trace:** Calls `src/services/searchService.ts`, which calls `src/repositories/searchDocumentRepository.ts`.
 **What a junior would likely miss:** Tenant safety can be tested at the service-to-repository boundary even before full integration tests exist.
+
+---
+
+# Goal and Check ladder for the reading path
+
+Use after the steps above. Every answer cites code so you can verify it.
+
+**After the session/permissions steps.** *Goal:* list what an attacker needs to act as the seeded owner. **Check:** two UUIDs in two headers (`src/lib/auth/session.ts:13-25`); the defaults are in `src/lib/http/client.ts:8-9`.
+
+**After `ticketService.ts`.** *Goal:* explain why the search document is built inside the write transaction but not written to `search_documents` there. **Check:** the document is stored as the event *payload* (`ticketService.ts:55-68`); the index is updated later by a job. That is the eventual-consistency boundary.
+
+**After `searchSyncEventRepository.ts`.** *Goal:* find the condition that makes the cursor unsafe. **Check:** `gt(searchSyncEvents.id, lastProcessedEventId)` at `src/repositories/searchSyncEventRepository.ts:37`, combined with out-of-order commits (finding T7).
+
+**After `indexingJobRunner.ts`.** *Goal:* list every write in `runIncrementalJob()` and say which share a transaction. **Check:** three writes (`:91`, `:92-94`, `:95`), none in a transaction.
+
+**After `indexingService.ts`.** *Goal:* find what clears `rebuildingGeneration`. **Check:** only `completeTenantRebuild()` (`src/repositories/tenantSearchStateRepository.ts:82-92`), called only on success.
+
+**Capstone.** *Goal:* write the runbook for "search is stale for one tenant". **Check:** compare with the debugging scenarios in `docs/learning/flow-traces.md`.

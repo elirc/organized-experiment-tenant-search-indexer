@@ -168,3 +168,15 @@ Reviewer focus:
 - `tests/search-service.tenant-isolation.test.ts`: verify the test guards tenant propagation at the service boundary
 - `docs/learning/flow-traces.md`: verify traces match the actual file/function names
 What a stronger reviewer would flag: frontend code that starts owning backend business rules instead of invoking them
+
+## Retrospective: journal decisions checked against the shipped code
+
+| Journal statement | What the code does | Evidence |
+| --- | --- | --- |
+| Incremental sync: "the index must survive partial failures and catch up later"; "Those tables are buying retries and visibility" | Visibility, yes (`indexing_jobs`, `pendingEventCount`). Retries, no: a `FAILED` job is never re-queued, and a batch that fails once fails every time (finding T2). | `src/repositories/indexingJobRepository.ts:98-107` |
+| Rebuild: "write a new generation and flip it when complete" | Implemented, with an atomic flip. Not covered: failures before the flip (T3) and incremental writes during the rebuild (T4). | `src/services/indexingJobRunner.ts:98-130` |
+| Slice 4: "a stronger reviewer would flag rebuild code that ... runs inline in the request" | The rebuild is queued rather than run by the *rebuild* request, but it then runs inline in the *run-pending* request. There is no separate worker. | `src/app/api/indexing-jobs/run-pending/route.ts:12-18` |
+| Slice 4: "verify incremental job coalescing behavior" | Coalescing is select-then-insert with no unique constraint, and a job stuck in `RUNNING` blocks all new incremental jobs for its tenant. | `indexingJobRepository.ts:26-59` |
+| Search architecture: "much cleaner reads and operational control" | Reads are clean. Performance depends on computing `to_tsvector` for every row of the tenant's generation per query, since no stored vector or GIN index exists. | `src/repositories/searchDocumentRepository.ts:70-79` |
+
+The decisions were sound; the gaps are in the failure paths each decision implies. The findings list in `docs/architecture/README.md` is the to-do list a next slice would start from.

@@ -40,3 +40,40 @@ Request: Reject a viewer trying to create a ticket
 4. `src/lib/permissions/roles.ts` — `requirePermission()` throws `ForbiddenError` because `VIEWER` is below `AGENT`
 5. `src/lib/http/responses.ts` — `handleRouteError()` maps the exception to JSON
 6. Returns `403` with `{ ok: false, error: { code: "FORBIDDEN", ... } }`
+
+
+## Ordering note
+
+In every route the order is: `withRouteContext()` authenticates first, then the handler parses the body. For example `src/app/api/tickets/route.ts:22-28` calls `withRouteContext(request, async (context) => { const body = createTicketSchema.parse(...) ... })`. The traces above list parsing as step 1 for readability, but an unauthenticated request is rejected with 401 before its body is read. A `ZodError` thrown by the parse is mapped to 400 `VALIDATION_ERROR` by `handleRouteError()` (`src/lib/http/responses.ts:16-29`).
+
+## Request: Run pending indexing jobs (with line numbers)
+
+This is the only request that changes `search_documents`, so it is worth knowing exactly.
+
+1. `src/app/api/indexing-jobs/run-pending/route.ts:12-18` — `withRouteContext()`, then `runPendingJobsSchema.parse()` (`limit` 1-20, default 5, `src/lib/validation/indexingSchemas.ts:16-19`).
+2. `src/services/indexingJobRunner.ts:33` — `requirePermission(context, "indexing-job:run")`, minimum `OWNER`.
+3. `indexingJobRunner.ts:35` — `listQueuedIndexingJobs(limit)`: oldest `QUEUED` jobs **across all tenants** (`src/repositories/indexingJobRepository.ts:61-68`).
+4. For each job, sequentially (`indexingJobRunner.ts:39-59`):
+   1. `markIndexingJobRunning(job.id)` — unconditional update (`indexingJobRepository.ts:70-81`).
+   2. `INCREMENTAL` → `runIncrementalJob(job.tenantId)` (`indexingJobRunner.ts:67-96`):
+      - read tenant state; read up to 200 events with `processedAt IS NULL` and `id > cursor`;
+      - map each event's stored payload to a row in the **active** generation;
+      - one multi-row upsert; then mark those events processed; then advance the cursor. Three statements, no transaction.
+   3. `REBUILD` → `runRebuildJob(job.tenantId, job.generation!, job.entityTypes)` (`:98-130`):
+      - read the full ticket and/or directory-user snapshot for the tenant;
+      - upsert every document into the **new** generation (outside any transaction);
+      - in one transaction: set `activeGeneration = new`, clear `rebuildingGeneration`, delete all documents of the old generation.
+   4. Success → `markIndexingJobCompleted()`; any thrown error → `markIndexingJobFailed()` with the message.
+5. Returns `200` with `{ processed, results: [{ jobId, status }] }` — including other tenants' job ids (finding T1).
+
+**Duration.** The whole loop runs inside the HTTP request. A rebuild of a large tenant holds the request open for as long as it takes to read and upsert every row.
+
+## What happens when it fails part-way
+
+| Crash or error point | State left behind | Recovers by itself? |
+| --- | --- | --- |
+| After `markIndexingJobRunning`, before work | job `RUNNING` forever (nothing lists `RUNNING` jobs) | No. And `ensureQueuedIncrementalJob()` treats a `RUNNING` incremental job as "already queued" (`indexingJobRepository.ts:41`), so **no new incremental job is created for that tenant** until someone fixes the row. |
+| Incremental: after upsert, before marking events | documents updated, events still pending | Yes, the next run re-applies the same payloads (upsert is idempotent for identical rows). |
+| Incremental: after marking events, before cursor update | events processed, cursor behind | Yes; the processed events are excluded by `processedAt IS NULL`. |
+| Rebuild: during the new-generation upserts | partial new generation; `rebuildingGeneration` still set | No. Job is `FAILED`, and every later rebuild request returns 409 (finding T3). |
+| Rebuild: inside the cutover transaction | rolled back as a unit | The cutover itself is safe; the job is marked `FAILED` and T3 applies. |
